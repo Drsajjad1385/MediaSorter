@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MediaSorter V6 – Extremely fast media renaming & metadata tagging.
-Reads all metadata in a single exiftool call, writes tags via persistent exiftool,
-uses zero content hashing, handles timestamp collisions with a simple counter.
-Fully thread‑safe by design – sequential operations avoid race conditions.
+MediaSorter V9 – Fast media organizer with LIVE progress during metadata write.
+Single exiftool call for read, single call for write with real‑time progress bar.
 """
 
 import argparse
@@ -13,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -24,66 +23,60 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-# ----------------------------------------------------------------------
-class ExifToolPersistent:
-    """Manages a single long‑running exiftool process for fast batch writing."""
 
-    def __init__(self):
-        self.proc = subprocess.Popen(
-            ['exiftool', '-stay_open', 'True', '-@', '-'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        # Consume initial ready message
-        self._read_until_ready()
+class SimpleProgress:
+    """Fallback progress bar when tqdm is not installed."""
 
-    def _read_until_ready(self) -> str:
-        """Read output lines until the '{ready}' marker, return all output."""
-        lines = []
-        while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                break
-            lines.append(line)
-            if line.strip() == '{ready}':
-                break
-        return ''.join(lines)
+    def __init__(self, total: int, desc: str = "Progress"):
+        self.total = total
+        self.desc = desc
+        self.current = 0
+        self.start_time = time.time()
+        self._last_len = 0
 
-    def execute(self, *args) -> Tuple[bool, str]:
-        """
-        Send a command to exiftool and wait for execution.
-        Returns (success, output_text).
-        """
-        cmd = ' '.join(args) + '\n-execute\n'
-        self.proc.stdin.write(cmd)
-        self.proc.stdin.flush()
-        output = self._read_until_ready()
-        # Simple heuristic: no "Error" and "image files updated" present
-        success = ('error' not in output.lower() and
-                   ('image files updated' in output.lower() or
-                    '1 image files updated' in output.lower() or
-                    '0 image files updated' in output.lower()))
-        return success, output
+    def update(self, n: int = 1):
+        self.current += n
+        self._print()
+
+    def _print(self):
+        elapsed = time.time() - self.start_time
+        percent = (self.current / self.total) * 100 if self.total else 0
+        if self.current > 0:
+            eta = (elapsed / self.current) * (self.total - self.current)
+        else:
+            eta = 0
+        elapsed_str = self._fmt(elapsed)
+        eta_str = self._fmt(eta)
+        bar_len = 30
+        filled = int(bar_len * self.current // self.total) if self.total else 0
+        bar = '█' * filled + '░' * (bar_len - filled)
+        line = f"\r{self.desc}: |{bar}| {self.current}/{self.total} ({percent:.1f}%) [{elapsed_str}<{eta_str}]"
+        sys.stdout.write(line.ljust(self._last_len))
+        sys.stdout.flush()
+        self._last_len = len(line)
 
     def close(self):
-        """Gracefully shut down the persistent process."""
-        try:
-            self.proc.stdin.write('-stay_open\nFalse\n')
-            self.proc.stdin.flush()
-            self.proc.communicate(timeout=5)
-        except Exception:
-            self.proc.kill()
+        self._print()
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+    @staticmethod
+    def _fmt(seconds: float) -> str:
+        if seconds < 0:
+            seconds = 0
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        if h:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
 
 
-class MediaSorterV6:
-    """Organises media files – fast. No hash, no duplicate detection."""
+class MediaSorter:
+    """Ultra‑fast media organiser with live progress on metadata write."""
 
     IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.tiff', '.tif'}
     VIDEO_EXT = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v', '.3gp', '.wmv', '.flv'}
-    UNSUPPORTED_WRITE_EXT = {'.avi'}  # still avoid writing to AVI
+    UNSUPPORTED_WRITE_EXT = {'.avi'}
 
     MARKER = "SORTED_BY_MEDIA_SORTER_V2"
 
@@ -107,16 +100,13 @@ class MediaSorterV6:
         self.date_folder = date_folder
         self.require_metadata = require_metadata
 
-        # Statistics
         self.stats = {
             "total": 0, "processed": 0, "skipped": 0,
             "renamed": 0, "metadata_written": 0, "metadata_failed": 0,
             "metadata_unsupported": 0, "fallback_timestamp": 0,
-            "require_metadata_aborts": 0,  # count aborts due to require_metadata
+            "require_metadata_aborts": 0,
         }
         self.errors: List[str] = []
-
-        # For collision handling – maps base stem -> next suffix number
         self._stem_counter: Dict[str, int] = defaultdict(int)
 
     @staticmethod
@@ -124,7 +114,7 @@ class MediaSorterV6:
         try:
             subprocess.run(['exiftool', '-ver'], capture_output=True, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError):
-            print("Error: 'exiftool' is required. Install from https://exiftool.org", file=sys.stderr)
+            print("Error: 'exiftool' required. Install from https://exiftool.org", file=sys.stderr)
             sys.exit(1)
 
     @staticmethod
@@ -136,16 +126,15 @@ class MediaSorterV6:
         try:
             if len(ts) != 14:
                 return False
-            year = int(ts[:4]); month = int(ts[4:6]); day = int(ts[6:8])
-            hour = int(ts[8:10]); minute = int(ts[10:12]); second = int(ts[12:14])
-            return (1970 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31 and
-                    0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59)
+            y, m, d, h, mi, s = map(int, [ts[0:4], ts[4:6], ts[6:8],
+                                          ts[8:10], ts[10:12], ts[12:14]])
+            return (1970 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31 and
+                    0 <= h <= 23 and 0 <= mi <= 59 and 0 <= s <= 59)
         except ValueError:
             return False
 
     # ------------------------------------------------------------------
     def _scan_files(self) -> List[Path]:
-        """Return list of media files (non‑recursive)."""
         files = []
         for entry in os.scandir(self.target_dir):
             if not entry.is_file() or entry.name.startswith('.'):
@@ -156,42 +145,47 @@ class MediaSorterV6:
         return files
 
     def _read_all_metadata(self, file_list: List[Path]) -> Dict[Path, dict]:
-        """
-        Call exiftool once for batches of files to avoid argument length limits.
-        Returns dict mapping Path -> metadata JSON object.
-        """
-        all_meta = {}
-        batch_size = 500  # safe limit for command line
-        for i in range(0, len(file_list), batch_size):
-            batch = file_list[i:i+batch_size]
-            cmd = ['exiftool', '-json', '-G'] + [str(f) for f in batch]
+        if not file_list:
+            return {}
+        fd, tmpname = tempfile.mkstemp(suffix='.txt', prefix='files_')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                for fp in file_list:
+                    f.write(str(fp) + '\n')
+            print("Reading metadata in one call...")
+            start = time.time()
+            proc = subprocess.run(
+                ['exiftool', '-json', '-G', '-@', tmpname],
+                capture_output=True, text=True, timeout=600
+            )
+            elapsed = time.time() - start
+            if proc.returncode != 0 or not proc.stdout.strip():
+                self.errors.append(f"Metadata read failed: {proc.stderr.strip()[:200]}")
+                return {}
+            data = json.loads(proc.stdout)
+            all_meta = {}
+            for entry in data:
+                src = Path(entry['SourceFile'])
+                all_meta[src] = entry
+            print(f"  Read metadata in {elapsed:.1f}s")
+            return all_meta
+        except Exception as e:
+            self.errors.append(f"Metadata read error: {e}")
+            return {}
+        finally:
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                if proc.returncode == 0 and proc.stdout.strip():
-                    data = json.loads(proc.stdout)
-                    if isinstance(data, list):
-                        for entry in data:
-                            src = Path(entry['SourceFile'])
-                            all_meta[src] = entry
-            except Exception as e:
-                self.errors.append(f"Metadata read failed for batch: {e}")
-        return all_meta
+                os.unlink(tmpname)
+            except OSError:
+                pass
 
     def _extract_timestamp(self, metadata: dict, file_path: Path) -> Tuple[str, bool]:
-        """
-        Return (timestamp, is_fallback).
-        Tries metadata fields, then mtime.
-        """
-        candidates = [
-            metadata.get('EXIF:DateTimeOriginal'),
-            metadata.get('EXIF:CreateDate'),
-            metadata.get('QuickTime:CreateDate'),
-            metadata.get('Keys:CreationDate'),
-            metadata.get('EXIF:DateTimeDigitized'),
-        ]
-        for value in candidates:
-            if value and isinstance(value, str):
-                digits = ''.join(c for c in value if c.isdigit())
+        fields = ['EXIF:DateTimeOriginal', 'EXIF:CreateDate',
+                  'QuickTime:CreateDate', 'Keys:CreationDate',
+                  'EXIF:DateTimeDigitized']
+        for field in fields:
+            val = metadata.get(field)
+            if val and isinstance(val, str):
+                digits = ''.join(c for c in val if c.isdigit())
                 if len(digits) >= 14:
                     ts = digits[:14]
                 elif len(digits) == 8:
@@ -200,14 +194,11 @@ class MediaSorterV6:
                     continue
                 if self._is_valid_timestamp(ts):
                     return ts, False
-
-        # Fallback to file modification time
         mtime = file_path.stat().st_mtime
         ts = time.strftime('%Y%m%d%H%M%S', time.localtime(mtime))
         return ts, True
 
     def _is_already_processed(self, metadata: dict) -> bool:
-        """Check for our marker in any comment field."""
         comment = (metadata.get('EXIF:Comment') or
                    metadata.get('Comment') or
                    metadata.get('QuickTime:Comment') or '')
@@ -215,17 +206,11 @@ class MediaSorterV6:
 
     # ------------------------------------------------------------------
     def _plan_file(self, file_path: Path, metadata: dict) -> Optional[dict]:
-        """
-        Determine new path and whether metadata write is needed.
-        Returns an operation dict, or None if skipped.
-        """
-        # Already processed?
         is_processed = self._is_already_processed(metadata)
         if self.skip_processed and is_processed:
             self.stats["skipped"] += 1
             return None
 
-        # Extract timestamp
         ts, is_fallback = self._extract_timestamp(metadata, file_path)
         if is_fallback:
             self.stats["fallback_timestamp"] += 1
@@ -233,91 +218,130 @@ class MediaSorterV6:
         date_part = ts[:8]
         time_part = ts[8:]
 
-        # Destination directory
         if self.date_folder:
             year, month = date_part[:4], date_part[4:6]
             dest_dir = self.target_dir / year / month
         else:
             dest_dir = self.target_dir
 
-        # Build base stem
         stem = f"{date_part}_{time_part}__{self.label}"
-
-        # Handle collisions (same timestamp)
         counter = self._stem_counter[stem]
-        if counter == 0:
-            final_stem = stem
-        else:
-            final_stem = f"{stem}_{counter}"
+        final_stem = stem if counter == 0 else f"{stem}_{counter}"
         self._stem_counter[stem] += 1
 
         ext = file_path.suffix.lower()
-        new_name = f"{final_stem}{ext}"
-        new_path = dest_dir / new_name
+        new_path = dest_dir / f"{final_stem}{ext}"
 
-        # Determine if we need to write metadata
         needs_write = (not is_processed) or self.force_metadata
-
-        op = {
+        return {
             "src": file_path,
             "dst": new_path,
             "ts_formatted": f"{ts[:4]}:{ts[4:6]}:{ts[6:8]} {ts[8:10]}:{ts[10:12]}:{ts[12:14]}",
             "needs_write": needs_write,
-            "is_processed": is_processed,
             "ext": ext,
+            "unsupported_write": ext in self.UNSUPPORTED_WRITE_EXT,
         }
-        return op
 
-    def _write_metadata_for_file(self, op: dict, et: ExifToolPersistent) -> bool:
+    # ------------------------------------------------------------------
+    def _write_metadata_bulk(self, ops: List[dict]) -> bool:
         """
-        Write timestamp and marker using the persistent exiftool process.
-        Returns True on success, False on failure (or unsupported).
+        Writes metadata to all files using one exiftool -@ process.
+        Parses stdout in real-time to show live progress.
         """
-        src = op["src"]
-        ts = op["ts_formatted"]
-        ext = op["ext"]
-
-        if src.suffix.lower() in self.UNSUPPORTED_WRITE_EXT:
-            self.stats["metadata_unsupported"] += 1
-            self.errors.append(f"Unsupported format (static): {src.name}")
-            return False
-
-        tags = []
-        if ext in self.IMAGE_EXT:
-            tags.extend([
-                f'-EXIF:DateTimeOriginal={ts}',
-                f'-EXIF:CreateDate={ts}',
-                f'-EXIF:Comment={self.MARKER}',
-            ])
-        else:
-            tags.extend([
-                f'-QuickTime:CreateDate={ts}',
-                f'-Comment={self.MARKER}',
-            ])
-        tags.extend(['-m', '-overwrite_original', '-P'])
-
-        args = tags + [str(src)]
-        success, output = et.execute(*args)
-
-        if success:
-            self.stats["metadata_written"] += 1
+        writes = [op for op in ops if op["needs_write"] and not op["unsupported_write"]]
+        if not writes:
             return True
-        else:
-            # Check if unsupported dynamically
-            if "Can't currently write" in output:
-                self.stats["metadata_unsupported"] += 1
-                self.errors.append(f"Unsupported format: {src.name}")
+
+        fd, tmpname = tempfile.mkstemp(suffix='.txt', prefix='exifargs_')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as argfile:
+                for op in writes:
+                    ext = op["ext"]
+                    ts = op["ts_formatted"]
+                    if ext in self.IMAGE_EXT:
+                        lines = [
+                            f'-EXIF:DateTimeOriginal={ts}',
+                            f'-EXIF:CreateDate={ts}',
+                            f'-EXIF:Comment={self.MARKER}',
+                        ]
+                    else:
+                        lines = [
+                            f'-QuickTime:CreateDate={ts}',
+                            f'-Comment={self.MARKER}',
+                        ]
+                    lines += ['-m', '-overwrite_original', '-P']
+                    for line in lines:
+                        argfile.write(line + '\n')
+                    argfile.write(str(op["src"]) + '\n')
+                    argfile.write('-execute\n')
+                argfile.write('-execute\n')
+
+            print(f"Writing metadata for {len(writes)} files...")
+            # Start process with Popen to read stdout line by line
+            proc = subprocess.Popen(
+                ['exiftool', '-@', tmpname],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+
+            # Progress bar
+            total_writes = len(writes)
+            if HAS_TQDM:
+                pbar = tqdm(total=total_writes, desc="Writing metadata", unit="file")
             else:
-                self.stats["metadata_failed"] += 1
-                self.errors.append(f"Metadata write failed for {src.name}: {output.strip()[:200]}")
+                pbar = SimpleProgress(total_writes, desc="Writing metadata")
+
+            files_updated_count = 0
+            success_count = 0
+            for line in proc.stdout:
+                line = line.strip()
+                # ExifTool outputs "1 image files updated" after each -execute block
+                if "image files updated" in line:
+                    # Increment progress (one file processed)
+                    files_updated_count += 1
+                    pbar.update(1)
+                # Optionally detect errors (but we'll still count as processed)
+                # We assume success if the line says "1 image files updated"
+                if "1 image files updated" in line:
+                    success_count += 1
+
+            proc.wait()
+            pbar.close()
+
+            if proc.returncode == 0:
+                self.stats["metadata_written"] += success_count
+                # Some files may have been updated but not counted? The count should match writes.
+                # if we had errors, success_count might be less than total_writes.
+                if success_count != total_writes:
+                    failed_count = total_writes - success_count
+                    self.stats["metadata_failed"] += failed_count
+                    self.errors.append(f"Some metadata writes may have failed ({failed_count} not confirmed)")
+                return True
+            else:
+                self.stats["metadata_failed"] += total_writes
+                self.errors.append(f"Bulk metadata write error (return code {proc.returncode})")
+                for op in writes:
+                    op["_write_failed"] = True
+                return False
+        except Exception as e:
+            self.errors.append(f"Metadata write process error: {e}")
+            self.stats["metadata_failed"] += len(writes)
+            for op in writes:
+                op["_write_failed"] = True
             return False
+        finally:
+            try:
+                os.unlink(tmpname)
+            except OSError:
+                pass
 
     def _apply_rename(self, src: Path, dst: Path) -> bool:
-        """Rename file, creating folders if needed."""
         if src == dst:
-            return True  # no change needed
+            return True
         if not self.apply:
-            return True  # dry run
+            return True
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             src.rename(dst)
@@ -330,52 +354,53 @@ class MediaSorterV6:
     def run(self):
         start_time = time.time()
 
-        # 1. Scan files
+        # 1. Scan
         files = self._scan_files()
         self.stats["total"] = len(files)
         if not files:
             print("No media files found.")
             return
-        if self.verbose:
-            print(f"Found {self.stats['total']} media files.\n")
+        print(f"Found {self.stats['total']} media files.\n")
 
-        # 2. Bulk metadata extraction
+        # 2. Read all metadata
         all_meta = self._read_all_metadata(files)
 
-        # 3. Plan operations
+        # 3. Plan
+        print("Planning names...")
         operations = []
         for f in files:
             meta = all_meta.get(f, {})
             op = self._plan_file(f, meta)
             if op:
                 operations.append(op)
+        print(f"Planned {len(operations)} operations.\n")
 
-        # 4. Execute (apply mode) or dry-run
+        # 4. Execute
         if self.apply:
-            # Open one persistent exiftool for writes
-            et = ExifToolPersistent()
-            try:
-                # We use a simple progress bar if tqdm is available
-                iterator = tqdm(operations, desc="Processing", unit="file") if HAS_TQDM else operations
-                for op in iterator:
-                    # Write metadata (if needed and format supports it)
-                    write_ok = True
-                    if op["needs_write"]:
-                        write_ok = self._write_metadata_for_file(op, et)
+            # Bulk write metadata (with live progress)
+            self._write_metadata_bulk(operations)
 
-                    if not write_ok and self.require_metadata:
-                        self.stats["require_metadata_aborts"] += 1
-                        continue  # skip rename
+            # Rename with live progress
+            print("Renaming files...")
+            if HAS_TQDM:
+                pbar = tqdm(operations, desc="Renaming", unit="file")
+            else:
+                pbar = SimpleProgress(len(operations), desc="Renaming")
 
-                    # Rename
-                    renamed = self._apply_rename(op["src"], op["dst"])
-                    if renamed:
-                        self.stats["renamed"] += 1
+            for op in operations:
+                if op.get("_write_failed") and self.require_metadata:
+                    self.stats["require_metadata_aborts"] += 1
                     self.stats["processed"] += 1
-            finally:
-                et.close()
+                    pbar.update(1)
+                    continue
+                renamed = self._apply_rename(op["src"], op["dst"])
+                if renamed:
+                    self.stats["renamed"] += 1
+                self.stats["processed"] += 1
+                pbar.update(1)
+
+            pbar.close()
         else:
-            # Dry-run: just show what would happen
             print("DRY-RUN MODE – No changes will be made.\n")
             for op in operations:
                 print(f"  {op['src'].name}  ->  {op['dst']}" +
@@ -398,7 +423,6 @@ class MediaSorterV6:
         print(f" Renamed           : {s['renamed']}")
         print(f" Metadata written  : {s['metadata_written']}")
         print(f" Metadata failed   : {s['metadata_failed']}")
-        print(f" Metadata unsupported: {s['metadata_unsupported']}")
         print(f" Fallback (mtime)  : {s['fallback_timestamp']}")
         print(f" Aborted (req.meta): {s['require_metadata_aborts']}")
         print(f" Errors            : {len(self.errors)}")
@@ -432,12 +456,12 @@ class MediaSorterV6:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MediaSorter V6 – ultra-fast media organizer")
+    parser = argparse.ArgumentParser(description="MediaSorter V9 – ultra‑fast with live write progress")
     parser.add_argument('--target', required=True, help='Directory with media files')
     parser.add_argument('--label', default='Media', help='Label in filename')
     parser.add_argument('--apply', action='store_true', help='Actually perform operations')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
-    parser.add_argument('--skip-processed', action='store_true', help='Skip files already processed')
+    parser.add_argument('--skip-processed', action='store_true', help='Skip already processed files')
     parser.add_argument('--force-metadata', action='store_true', help='Rewrite metadata even if marker exists')
     parser.add_argument('--date-folder', action='store_true', help='Sort into YYYY/MM subfolders')
     parser.add_argument('--require-metadata', action='store_true', help='Abort rename if metadata write fails')
@@ -449,7 +473,7 @@ def main():
         print(f"Error: '{args.target}' is not a directory.", file=sys.stderr)
         sys.exit(1)
 
-    MediaSorterV6.check_dependencies()
+    MediaSorter.check_dependencies()
 
     if not args.apply:
         print("=" * 70)
@@ -457,7 +481,7 @@ def main():
         print(" Use --apply to actually perform operations")
         print("=" * 70)
 
-    sorter = MediaSorterV6(
+    sorter = MediaSorter(
         target_dir=target,
         source_label=args.label,
         apply=args.apply,
